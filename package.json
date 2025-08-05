@@ -1,0 +1,19 @@
+{
+  "name": "message-bot",
+  "version": "1.0.0",
+  "main": "main.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "express": "^5.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^2.0.2",
+    "qrcode": "^1.5.4",
+    "whatsapp-web.js": "^1.31.0"
+  }
+}
