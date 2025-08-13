@@ -20,3 +20,7 @@ venv/
 
 # macOS
 .DS_Store
+
+node_modules
+.wwebjs_auth
+.wwebjs_cache

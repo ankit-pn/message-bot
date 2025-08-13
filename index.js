@@ -6,6 +6,7 @@
 // =================================================================================================
 
 const express = require('express');
+const cors = require('cors'); // 
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
 const jwt = require('jsonwebtoken');
@@ -15,7 +16,8 @@ const path = require('path');
 
 // --- Basic Setup ---
 const app = express();
-const port = process.env.PORT || 3000;
+app.use(cors());
+const port = process.env.PORT || 4000;
 const JWT_SECRET = 'your-super-secret-jwt-key'; // IMPORTANT: Change this to a strong, secret key
 
 // --- Middleware ---
@@ -26,6 +28,11 @@ app.use(express.urlencoded({ extended: true }));
 // In a production environment, you would use a persistent store like Redis or a database.
 const sessions = {};
 const sessionTokens = {};
+
+
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
 
 // --- Multer setup for file uploads ---
 // This configures multer to store uploaded files in a directory named 'uploads'.
@@ -239,60 +246,111 @@ app.get('/check_status', (req, res) => {
 });
 
 /**
- * @api {post} /send_message
- * @description Sends a message (text and/or media) to a phone number.
- * @header Authorization: Bearer <session_token>
- * @body {string} phoneNumber - The recipient's phone number (e.g., 911234567890).
- * @body {string} [message] - The text message to send.
- * @body {file} [media] - A media file to send (image, video, document).
+ * POST /send_message
+ * Send text + 0–N media items (file upload, URL, or base64)
+ *
+ * Body (JSON):
+ * {
+ *   "phoneNumber": "911234567890",
+ *   "message": "optional caption",
+ *   "media": [
+ *     { "url": "https://example.com/cat.jpg" },
+ *     {
+ *       "data": "<base64…>",
+ *       "mimetype": "application/pdf",
+ *       "filename": "doc.pdf"
+ *     }
+ *   ]
+ * }
+ *
+ * OR multipart/form-data with fields:
+ *   phoneNumber, message (optional), media (file)
  */
-app.post('/send_message', verifyToken, upload.single('media'), async (req, res) => {
+app.post('/send_message',
+  verifyToken,
+  upload.single('media'),              // keeps multipart support
+  async (req, res) => {
+
     const { phoneNumber, message } = req.body;
-    const { sessionId } = req; // Retrieved from the verified token
-    const mediaFile = req.file;
+    const { sessionId } = req;
 
     if (!phoneNumber) {
-        return res.status(400).json({ error: 'phoneNumber is required.' });
-    }
-    if (!message && !mediaFile) {
-        return res.status(400).json({ error: 'Either a message or a media file is required.' });
+      return res.status(400).json({ error: 'phoneNumber is required.' });
     }
 
-    const client = sessions[sessionId]?.client;
-
-    if (!client || sessions[sessionId]?.status !== 'READY') {
-        return res.status(400).json({ error: 'The session is not active or ready.' });
+    // Collect media objects from either source
+    const mediaPayload = [];
+    // 1. Multipart upload
+    if (req.file) {
+      mediaPayload.push({ path: req.file.path });
+    }
+    // 2. Inline JSON (could be object or array)
+    if (req.body.media) {
+      let bodyMedia = req.body.media;
+      if (typeof bodyMedia === 'string') {
+        try { bodyMedia = JSON.parse(bodyMedia); } catch { /* ignore */ }
+      }
+      (Array.isArray(bodyMedia) ? bodyMedia : [bodyMedia])
+        .forEach(item => mediaPayload.push(item));
     }
 
-    // WhatsApp numbers need to be in the format <country_code><number>@c.us
+    if (!message && mediaPayload.length === 0) {
+      return res.status(400).json({ error: 'Either a message or media is required.' });
+    }
+
+    const session = sessions[sessionId];
+    if (!session || session.status !== 'READY') {
+      return res.status(400).json({ error: 'Session is not active or ready.' });
+    }
+    const client = session.client;
     const chatId = `${phoneNumber.replace(/\D/g, '')}@c.us`;
 
     try {
-        let response;
-        // Send media if it exists
-        if (mediaFile) {
-            const media = MessageMedia.fromFilePath(mediaFile.path);
-            response = await client.sendMessage(chatId, media, { caption: message || '' });
-            // Clean up the uploaded file after sending
-            fs.unlinkSync(mediaFile.path);
-        } else {
-            // Send text message
-            response = await client.sendMessage(chatId, message);
-        }
-        
-        console.log(`[Session ${sessionId}] Message sent successfully to ${phoneNumber}.`);
-        res.json({ success: true, messageId: response.id.id, message: 'Message sent successfully.' });
+      const sentIds = [];
 
-    } catch (error) {
-        console.error(`[Session ${sessionId}] Error sending message to ${phoneNumber}:`, error);
-        res.status(500).json({ success: false, error: 'Failed to send message.', details: error.message });
-        // Clean up file if sending failed
-        if (mediaFile && fs.existsSync(mediaFile.path)) {
-            fs.unlinkSync(mediaFile.path);
+      // helper to materialise any payload item -> MessageMedia
+      const toMessageMedia = async (item) => {
+        if (item.path) {
+          return MessageMedia.fromFilePath(item.path);
         }
+        if (item.url) {
+          return await MessageMedia.fromUrl(item.url);
+        }
+        if (item.data && item.mimetype) {
+          return new MessageMedia(item.mimetype, item.data, item.filename || 'file');
+        }
+        throw new Error('Unsupported media descriptor');
+      };
+
+      if (mediaPayload.length > 0) {
+        // send first media with optional caption
+        const first = await toMessageMedia(mediaPayload[0]);
+        const resp = await client.sendMessage(chatId, first, { caption: message || '' });
+        sentIds.push(resp.id.id);
+
+        // send remaining media without caption
+        for (let i = 1; i < mediaPayload.length; i++) {
+          const mediaObj = await toMessageMedia(mediaPayload[i]);
+          const r = await client.sendMessage(chatId, mediaObj);
+          sentIds.push(r.id.id);
+        }
+      } else {
+        // text-only path
+        const r = await client.sendMessage(chatId, message);
+        sentIds.push(r.id.id);
+      }
+
+      // clean up local upload if used
+      if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+
+      console.log(`[Session ${sessionId}] Sent to ${phoneNumber}`);
+      return res.json({ success: true, messageIds: sentIds });
+    } catch (err) {
+      console.error(`[Session ${sessionId}] Send error:`, err);
+      if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+      return res.status(500).json({ error: 'Failed to send message.', details: err.message });
     }
 });
-
 
 // =================================================================================================
 // Server Start
